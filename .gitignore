@@ -18,7 +18,14 @@ coverage/
 .nyc_output/
 postgres_data/
 *.parquet
-*.csv
-*.json
-*.xml
-.env.local.js
+
+# Test output files
+*_test.txt
+*_clean.txt
+jsonout.txt
+*out.txt
+csv_test.txt
+json_clean.txt
+csv_clean.txt
+xml_clean.txt
+
