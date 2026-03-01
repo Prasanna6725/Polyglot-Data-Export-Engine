@@ -1,0 +1,19 @@
+# ignore node modules and build artifacts
+node_modules
+npm-debug.log
+
+# ignore version control directories
+.git
+.gitignore
+
+# ignore test files and local data
+*.csv
+*.txt
+# ignore general json data but make exceptions for package manifests
+*.json
+!package.json
+!package-lock.json
+*.xml
+
+# ignore temporary files
+tmpDockerfile

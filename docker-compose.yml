@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:13-alpine
@@ -8,6 +6,8 @@ services:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
       POSTGRES_DB: exports_db
+      # fixed default for seeding. can still be overridden via host `.env` if needed
+      TOTAL_ROWS: "10000000"
     ports:
       - "5432:5432"
     volumes:
@@ -41,6 +41,8 @@ services:
       - EXPORT_CHUNK_SIZE=1000
       - EXPORT_TIMEOUT=600000
       - MAX_MEMORY_MB=256
+      # pass seed size so entrypoint knows when to start
+      # TOTAL_ROWS is only needed by the database seeding; app doesn’t use it
     mem_limit: 256m
     memswap_limit: 256m
     volumes:

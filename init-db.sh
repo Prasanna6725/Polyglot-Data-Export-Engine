@@ -4,6 +4,9 @@ set -e
 echo "Starting database initialization..."
 
 # Create the records table
+# determine desired row count from environment (shell variable)
+total_rows_env=${TOTAL_ROWS:-10000000}
+
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     -- Drop existing table if it exists (for idempotency)
     DROP TABLE IF EXISTS records CASCADE;
@@ -23,10 +26,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
 
     -- Seed data using a procedural approach
     -- This approach is efficient and handles large datasets well
+
     DO \$\$
     DECLARE
         batch_size INT := 10000;
-        total_rows INT := 10000000;
+        total_rows INT := ${total_rows_env};
         i INT := 0;
         start_time TIMESTAMP;
     BEGIN

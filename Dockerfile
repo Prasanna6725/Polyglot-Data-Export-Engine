@@ -15,6 +15,10 @@ WORKDIR /app
 # Install dumb-init and bash for proper signal handling and entrypoint
 RUN apk add --no-cache dumb-init bash
 
+# sanity check: ensure passwd file hasn't been corrupted by earlier layers
+RUN [ -s /etc/passwd ] || echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+RUN grep -q '^root:' /etc/passwd
+
 # Copy node_modules from builder
 COPY --from=builder /app/node_modules ./node_modules
 
@@ -25,9 +29,10 @@ COPY . .
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
-# Create non-root user
+# Create non-root user (ensure passwd file still intact afterwards)
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
+RUN grep -q '^nodejs:' /etc/passwd || (echo "nodejs:x:1001:1001::/app:/sbin/nologin" >> /etc/passwd)
 
 # Install PostgreSQL client tools for wait script
 RUN apk add --no-cache postgresql-client

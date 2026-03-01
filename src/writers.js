@@ -316,8 +316,7 @@ class ParquetWriterOptimized extends StreamingWriter {
     super(exportJob);
     this.buffer = [];
     this.bufferSize = 50000;
-    this.tempFile = null;
-    this.parquetWriter = null;
+    this.schema = null;      // schema created on first flush
   }
 
   transformRowColumns(row) {
@@ -348,38 +347,49 @@ class ParquetWriterOptimized extends StreamingWriter {
   async flushBuffer() {
     if (this.buffer.length === 0) return;
 
-    try {
-      const parquet = require('parquetjs');
-      const fs = require('fs');
-      const path = require('path');
-      const os = require('os');
+    const parquet = require('parquetjs');
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
 
-      // Create temp file on first flush
-      if (!this.tempFile) {
-        this.tempFile = path.join(os.tmpdir(), `parquet_${Date.now()}_${Math.random().toString(36).slice(2)}.parquet`);
-        
-        // Create schema
-        const firstRow = this.buffer[0];
-        const schemaObj = {};
-        
-        for (const col of this.columns) {
-          schemaObj[col.target] = { type: 'UTF8', optional: true };
-        }
-
-        const schema = new parquet.ParquetSchema(schemaObj);
-        this.parquetWriter = parquet.ParquetWriter.openFile(schema, this.tempFile);
+    // build schema once
+    if (!this.schema) {
+      const schemaObj = {};
+      for (const col of this.columns) {
+        schemaObj[col.target] = { type: 'UTF8', optional: true };
       }
-
-      // Write buffered rows
-      for (const row of this.buffer) {
-        await this.parquetWriter.appendRow(row);
-      }
-
-      this.buffer = [];
-    } catch (error) {
-      console.error('Error flushing parquet buffer:', error);
-      throw error;
+      this.schema = new parquet.ParquetSchema(schemaObj);
     }
+
+    // write current buffer to a temporary chunk file
+    const chunkFile = path.join(os.tmpdir(), `parquet_chunk_${Date.now()}_${Math.random().toString(36).slice(2)}.parquet`);
+    const writer = await parquet.ParquetWriter.openFile(this.schema, chunkFile);
+
+    try {
+      for (const row of this.buffer) {
+        await writer.appendRow(row);
+      }
+    } finally {
+      await writer.close();
+    }
+
+    // stream the chunk immediately, then delete it
+    await new Promise((resolve, reject) => {
+      const readStream = fs.createReadStream(chunkFile);
+      readStream.on('data', (chunk) => {
+        this.push(chunk);
+      });
+      readStream.on('end', () => {
+        fs.unlink(chunkFile, (err) => {
+          if (err) console.error('Error deleting chunk file:', err);
+        });
+        resolve();
+      });
+      readStream.on('error', reject);
+    });
+
+    // release buffer memory
+    this.buffer = [];
   }
 
   async finalize() {
@@ -388,61 +398,38 @@ class ParquetWriterOptimized extends StreamingWriter {
       await this.flushBuffer();
     }
 
-    // Close writer and stream file
-    if (this.parquetWriter) {
-      await this.parquetWriter.close();
-
-      const fs = require('fs');
-      const readStream = fs.createReadStream(this.tempFile);
-      
-      readStream.on('data', (chunk) => {
-        this.push(chunk);
-      });
-
-      await new Promise((resolve, reject) => {
-        readStream.on('end', () => {
-          // Clean up temp file
-          fs.unlink(this.tempFile, (err) => {
-            if (err) console.error('Error deleting temp file:', err);
-          });
-          this.push(null);
-          resolve();
-        });
-        readStream.on('error', reject);
-      });
-    } else {
-      this.push(null);
-    }
+    // signal end of stream
+    this.push(null);
   }
 }
 
 // Factory function to create the appropriate writer
-function createExportWriter(exportJob, res) {
+// NOTE: headers are the caller's responsibility; do NOT touch the response here.
+// The returned writer is a readable stream which should be piped to the response
+// by the caller (e.g. `writer.pipe(res)`).
+function createExportWriter(exportJob) {
   const format = exportJob.format;
   let writer;
 
   switch (format) {
     case 'csv':
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       writer = new CSVWriter(exportJob);
       break;
     case 'json':
-      res.setHeader('Content-Type', 'application/json');
       writer = new JSONWriter(exportJob);
       break;
     case 'xml':
-      res.setHeader('Content-Type', 'application/xml');
       writer = new XMLWriter_Stream(exportJob);
       break;
     case 'parquet':
-      res.setHeader('Content-Type', 'application/octet-stream');
       writer = new ParquetWriterOptimized(exportJob);
       break;
     default:
       throw new Error(`Unsupported format: ${format}`);
   }
 
-  // Start streaming immediately
+  // Start the database streaming process immediately; errors will be emitted on
+  // the writer stream itself so the caller can handle them.
   writer.streamFromDatabase().catch((error) => {
     writer.emit('error', error);
   });

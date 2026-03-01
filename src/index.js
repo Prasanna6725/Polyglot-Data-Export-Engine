@@ -2,7 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
-const { createExportWriter } = require('./writers');
+const { createWriter } = require('./writers-refactored');
+const zlib = require('zlib');
 const { ExportStore } = require('./exportStore');
 
 const app = express();
@@ -73,130 +74,207 @@ app.post('/exports', async (req, res) => {
 
 // GET /exports/{exportId}/download - Download export
 app.get('/exports/:exportId/download', async (req, res) => {
-  console.log('Download route entered');
+  console.log('Download route entered for', req.params.exportId);
 
   let client;
   try {
     const { exportId } = req.params;
-    console.log('Looking up export job', exportId);
     const exportJob = exportStore.get(exportId);
-    console.log('Export job retrieved:', exportJob ? exportJob.exportId : null);
+    
     if (!exportJob) {
-      console.log('Export job not found, returning 404');
+      console.log('Export job not found:', exportId);
       return res.status(404).json({ error: 'Export job not found' });
     }
-    console.log('Export format is', exportJob.format);
 
+    const format = exportJob.format;
+    console.log('Export format:', format);
+
+    // Validate format
+    if (!['csv', 'json', 'xml', 'parquet'].includes(format)) {
+      return res.status(400).json({ error: 'Unsupported format' });
+    }
+
+    // SET ALL HEADERS NOW (only once, at the start)
+    const contentType = {
+      csv: 'text/csv; charset=utf-8',
+      json: 'application/json',
+      xml: 'application/xml',
+      parquet: 'application/octet-stream',
+    }[format];
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="export.${format}"`);
+
+    // Handle gzip compression (NOT for parquet)
+    let output = res;
+    const shouldCompress = exportJob.compression === 'gzip' && format !== 'parquet';
+    if (shouldCompress) {
+      res.setHeader('Content-Encoding', 'gzip');
+      output = zlib.createGzip();
+      output.pipe(res);
+    }
+
+    // Flush headers
+    res.flushHeaders();
+    console.log('Headers flushed');
+
+    // Mark as in progress
     exportJob.status = 'in_progress';
     exportStore.set(exportId, exportJob);
 
-    // choose headers based on format
-    switch (exportJob.format) {
-      case 'csv':
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        break;
-      case 'json':
-        res.setHeader('Content-Type', 'application/json');
-        break;
-      case 'xml':
-        res.setHeader('Content-Type', 'application/xml');
-        break;
-      case 'parquet':
-        res.setHeader('Content-Type', 'application/octet-stream');
-        break;
-      default:
-        return res.status(400).json({ error: 'Unsupported format' });
-    }
-    res.setHeader('Content-Disposition', `attachment; filename="export.${exportJob.format}"`);
-    res.flushHeaders();
-
-    console.log('Headers sent, acquiring client');
+    // Acquire database client
     client = await db.getClient();
 
-    console.log('BEGIN');
-    await client.query('BEGIN');
-    console.log('DECLARE cursor');
-    await client.query('DECLARE export_cursor CURSOR FOR SELECT id, name, value FROM records');
-
-    // streaming logic per format
-    if (exportJob.format === 'parquet') {
-      // delegate to Parquet writer
-      const writer = createExportWriter(exportJob, res);
-      // writer is a readable stream; commit/close inside loop
-      while (true) {
-        console.log('Loop fetch');
-        const result = await client.query('FETCH 1000 FROM export_cursor');
-        if (result.rows.length === 0) break;
-        for (const row of result.rows) {
-          await writer.writeRow(row);
+    try {
+      // PARQUET format uses special handling
+      if (format === 'parquet') {
+        const parquet = require('parquetjs');
+        const fs = require('fs');
+        const path = require('path');
+        
+        // Create schema
+        const schemaObj = {};
+        for (const col of exportJob.columns) {
+          schemaObj[col.target] = { type: 'UTF8', optional: true };
         }
-      }
-      console.log('Closing and commit');
-      await client.query('CLOSE export_cursor');
-      await client.query('COMMIT');
-      await writer.finalize();
-      res.end();
-      return;
-    }
-
-    // non-parquet formats
-    let firstJson = true;
-    if (exportJob.format === 'csv') {
-      res.write('ID,Name,Value\n');
-    } else if (exportJob.format === 'json') {
-      res.write('[');
-    } else if (exportJob.format === 'xml') {
-      res.write('<?xml version="1.0" encoding="UTF-8"?>\n<records>\n');
-    }
-
-    while (true) {
-      console.log('Loop fetch');
-      const result = await client.query('FETCH 1000 FROM export_cursor');
-      if (result.rows.length === 0) break;
-      for (const row of result.rows) {
-        if (exportJob.format === 'csv') {
-          const line = `${row.id},${row.name},${row.value}\n`;
-          if (!res.write(line)) {
-            await new Promise((r) => res.once('drain', r));
-          }
-        } else if (exportJob.format === 'json') {
-          const json = JSON.stringify(row);
-          if (!firstJson) {
-            if (!res.write(',')) {
-              await new Promise((r) => res.once('drain', r));
+        const schema = new parquet.ParquetSchema(schemaObj);
+        
+        // Temp file for parquet output
+        const tempFile = path.join('/tmp', `export_${exportId}_${Date.now()}.parquet`);
+        
+        // Start transaction and declare cursor
+        await client.query('BEGIN');
+        await client.query('DECLARE export_cursor CURSOR FOR SELECT id, name, value, metadata, created_at FROM records');
+        
+        // Create parquet writer
+        const parquetWriter = await parquet.ParquetWriter.openFile(schema, tempFile);
+        
+        try {
+          // Stream data from cursor
+          const chunkSize = parseInt(process.env.EXPORT_CHUNK_SIZE) || 1000;
+          let totalRows = 0;
+          
+          while (true) {
+            const result = await client.query(`FETCH ${chunkSize} FROM export_cursor`);
+            if (result.rows.length === 0) break;
+            
+            for (const row of result.rows) {
+              const transformedRow = {};
+              for (const col of exportJob.columns) {
+                const value = row[col.source];
+                transformedRow[col.target] = value === null || value === undefined ? null : 
+                  (typeof value === 'object' ? JSON.stringify(value) : String(value));
+              }
+              await parquetWriter.appendRow(transformedRow);
+              totalRows++;
             }
           }
-          if (!res.write(json)) {
-            await new Promise((r) => res.once('drain', r));
-          }
-          firstJson = false;
-        } else if (exportJob.format === 'xml') {
-          const xml =
-            `  <record><id>${row.id}</id><name>${row.name}</name><value>${row.value}</value></record>\n`;
-          if (!res.write(xml)) {
-            await new Promise((r) => res.once('drain', r));
+          
+          console.log('Exported', totalRows, 'rows to Parquet');
+          
+          // Close parquet writer
+          await parquetWriter.close();
+          
+          // Stream file to response
+          const fileStream = fs.createReadStream(tempFile);
+          fileStream.pipe(output);
+          
+          await new Promise((resolve, reject) => {
+            fileStream.on('end', resolve);
+            fileStream.on('error', reject);
+          });
+          
+          // Clean up temp file
+          fs.unlink(tempFile, (err) => {
+            if (err) console.error('Error deleting temp parquet file:', err);
+          });
+        } finally {
+          await client.query('CLOSE export_cursor');
+          await client.query('COMMIT');
+        }
+      } else {
+        // CSV, JSON, XML formats
+        const writer = createWriter(format, exportJob.columns);
+        console.log('Writer created for format:', format);
+        
+        // Start transaction and declare cursor
+        await client.query('BEGIN');
+        await client.query('DECLARE export_cursor CURSOR FOR SELECT id, name, value, metadata, created_at FROM records');
+
+        // Write header
+        const header = writer.getHeader();
+        if (header) {
+          output.write(header);
+        }
+
+        // Stream data from cursor
+        const chunkSize = parseInt(process.env.EXPORT_CHUNK_SIZE) || 1000;
+        let totalRows = 0;
+
+        while (true) {
+          const result = await client.query(`FETCH ${chunkSize} FROM export_cursor`);
+          if (result.rows.length === 0) break;
+
+          for (const row of result.rows) {
+            const serialized = writer.serializeRow(row);
+            if (!output.write(serialized)) {
+              // pause if write buffer is full
+              await new Promise((resolve) => output.once('drain', resolve));
+            }
+            totalRows++;
           }
         }
+
+        // Write footer
+        const footer = writer.getFooter();
+        if (footer) {
+          output.write(footer);
+        }
+
+        console.log('Exported', totalRows, 'rows');
+
+        // Close cursor and transaction
+        await client.query('CLOSE export_cursor');
+        await client.query('COMMIT');
       }
-    }
 
-    if (exportJob.format === 'json') {
-      res.write(']');
-    } else if (exportJob.format === 'xml') {
-      res.write('</records>');
-    }
+      // End the stream properly
+      if (shouldCompress) {
+        output.end();
+      } else {
+        res.end();
+      }
 
-    console.log('Closing and commit');
-    await client.query('CLOSE export_cursor');
-    await client.query('COMMIT');
-    console.log('Ending response');
-    res.end();
+      // Mark as completed
+      exportJob.status = 'completed';
+      exportStore.set(exportId, exportJob);
+    } catch (err) {
+      // Rollback on error
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Error rolling back:', rollbackErr.message);
+      }
+      throw err;
+    }
   } catch (err) {
     console.error('Download error:', err.message);
+
+    // Only send error response if headers haven't been sent
     if (!res.headersSent) {
-      return res.status(500).json({ error: 'Export failed' });
+      return res.status(500).json({ error: 'Export failed', message: err.message });
     }
-    if (client) client.release();
+
+    // Headers already sent, destroy the connection
+    try {
+      res.destroy(err);
+    } catch (_) {
+      /* best effort */
+    }
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
@@ -214,23 +292,15 @@ app.get('/exports/benchmark', async (req, res) => {
       const startTime = Date.now();
       const startMem = process.memoryUsage().heapUsed / 1024 / 1024;
 
-      // Create a temporary export job
-      const exportId = uuidv4();
-      const exportJob = {
-        exportId,
-        format,
-        columns: [
-          { source: 'id', target: 'id' },
-          { source: 'created_at', target: 'created_at' },
-          { source: 'name', target: 'name' },
-          { source: 'value', target: 'value' },
-          { source: 'metadata', target: 'metadata' },
-        ],
-        compression: null,
-        status: 'benchmarking',
-      };
+      const columns = [
+        { source: 'id', target: 'id' },
+        { source: 'created_at', target: 'created_at' },
+        { source: 'name', target: 'name' },
+        { source: 'value', target: 'value' },
+        { source: 'metadata', target: 'metadata' },
+      ];
 
-      // Create a mock response stream
+      // Create a mock response stream to measure output size
       const { PassThrough } = require('stream');
       const mockRes = new PassThrough();
       let contentLength = 0;
@@ -239,15 +309,55 @@ app.get('/exports/benchmark', async (req, res) => {
         contentLength += chunk.length;
       });
 
-      const writer = createExportWriter(exportJob, mockRes);
-      writer.pipe(mockRes);
+      try {
+        let client = await db.getClient();
 
-      // Wait for stream to complete
-      await new Promise((resolve, reject) => {
-        mockRes.on('finish', resolve);
-        mockRes.on('error', reject);
-        writer.on('error', reject);
-      });
+        try {
+          await client.query('BEGIN');
+          await client.query('DECLARE export_cursor CURSOR FOR SELECT id, name, value, metadata, created_at FROM records');
+
+          const writer = createWriter(format, columns);
+
+          const header = writer.getHeader();
+          if (header) {
+            mockRes.write(header);
+          }
+
+          let rowCount = 0;
+          while (true) {
+            const result = await client.query('FETCH 1000 FROM export_cursor');
+            if (result.rows.length === 0) break;
+
+            for (const row of result.rows) {
+              const serialized = writer.serializeRow(row);
+              if (!mockRes.write(serialized)) {
+                await new Promise((r) => mockRes.once('drain', r));
+              }
+              rowCount++;
+            }
+          }
+
+          const footer = writer.getFooter();
+          if (footer) {
+            mockRes.write(footer);
+          }
+
+          await client.query('CLOSE export_cursor');
+          await client.query('COMMIT');
+
+          console.log(`Exported ${rowCount} rows in benchmark`);
+        } catch (err) {
+          try {
+            await client.query('ROLLBACK');
+          } catch (_) {}
+          throw err;
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        console.error(`Benchmark error for ${format}:`, err.message);
+        continue;
+      }
 
       const endTime = Date.now();
       const endMem = process.memoryUsage().heapUsed / 1024 / 1024;
@@ -263,7 +373,6 @@ app.get('/exports/benchmark', async (req, res) => {
 
       console.log(`Benchmark for ${format} completed: ${duration.toFixed(2)}s, ${contentLength} bytes`);
 
-      // Force garbage collection if available
       if (global.gc) {
         global.gc();
       }
