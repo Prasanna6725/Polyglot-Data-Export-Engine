@@ -1,18 +1,23 @@
-Testing Guide
+# Polyglot Data Export Engine — Testing Guide
 
-This section provides step-by-step instructions to verify that the Data Export Engine is working correctly. All commands can be copied and executed directly in a terminal.
+This guide provides **step-by-step instructions** to verify that the Data Export Engine works correctly.
 
-1. Start the Application
+All commands can be **copied and pasted directly into the terminal**.
 
-Navigate to the project directory:
+---
 
+# 🚀 1. Start the Application
+
+Navigate to the project directory.
+
+```bash
 cd Polyglot-Data-Export-Engine
 
-Stop any existing containers and remove old volumes:
+Stop any running containers and remove volumes.
 
 docker-compose down -v
 
-Start the system:
+Start the system.
 
 docker-compose up --build
 
@@ -21,11 +26,11 @@ Wait until the logs show:
 Database connected
 Server listening on port 8080
 
-Open a new terminal for the following tests.
+Open a new terminal window for the next steps.
 
-2. Verify Database Seeding
+🗄️ 2. Verify Database Seeding
 
-Check that the database contains the required dataset.
+Check that the database contains the dataset.
 
 docker-compose exec db psql -U user -d exports_db -c "SELECT COUNT(*) FROM records;"
 
@@ -33,9 +38,9 @@ Expected result:
 
 10000000
 
-This confirms the database was seeded with 10 million rows.
+This confirms the database contains 10 million rows.
 
-3. Health Check
+❤️ 3. Health Check
 
 Verify that the API server is running.
 
@@ -44,97 +49,78 @@ curl http://localhost:8080/health
 Expected response:
 
 {"status":"ok"}
-4. Test CSV Export
-
-Create a CSV export job:
-
+📄 4. Test CSV Export
+Create Export Job
 export_id=$(curl -s -X POST http://localhost:8080/exports \
 -H "Content-Type: application/json" \
 -d '{"format":"csv","columns":[{"source":"id","target":"ID"},{"source":"name","target":"Name"},{"source":"value","target":"Value"}]}' \
 | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
 
 echo $export_id
-
-Download the CSV file:
-
+Download CSV
 curl http://localhost:8080/exports/$export_id/download -o export.csv
-
-Verify the number of rows:
-
+Verify row count
 wc -l export.csv
 
 Expected result:
 
 10000001
 
-(10,000,000 records + header row)
+(10M rows + header)
 
-5. Test JSON Export
-
-Create a JSON export job:
-
+🧾 5. Test JSON Export
+Create Export
 export_id=$(curl -s -X POST http://localhost:8080/exports \
 -H "Content-Type: application/json" \
 -d '{"format":"json","columns":[{"source":"id","target":"id"},{"source":"metadata","target":"metadata"}]}' \
 | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
 
 echo $export_id
-
-Download the JSON file:
-
+Download JSON
 curl http://localhost:8080/exports/$export_id/download -o export.json
-
-Validate JSON structure:
-
+Validate JSON
 python -m json.tool export.json > /dev/null
 
-If no error appears, the JSON file is valid.
+If no error appears, the JSON is valid.
 
-6. Test XML Export
-
-Create an XML export job:
-
+📑 6. Test XML Export
+Create XML Export
 export_id=$(curl -s -X POST http://localhost:8080/exports \
 -H "Content-Type: application/json" \
 -d '{"format":"xml","columns":[{"source":"id","target":"id"},{"source":"metadata","target":"metadata"}]}' \
 | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
 
 echo $export_id
-
-Download the XML file:
-
+Download XML
 curl http://localhost:8080/exports/$export_id/download -o export.xml
-
-Count XML records:
-
+Verify record count
 grep -c "<record>" export.xml
 
 Expected result:
 
 10000000
-7. Test Parquet Export
-
-Create a Parquet export job:
-
+📊 7. Test Parquet Export
+Create Parquet Export
 export_id=$(curl -s -X POST http://localhost:8080/exports \
 -H "Content-Type: application/json" \
 -d '{"format":"parquet","columns":[{"source":"id","target":"id"},{"source":"metadata","target":"metadata"}]}' \
 | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
 
 echo $export_id
-
-Download the Parquet file:
-
+Download Parquet
 curl http://localhost:8080/exports/$export_id/download -o export.parquet
+Verify using Python
 
-Verify the file using Python:
+Start Python:
 
 python
 
-Inside Python:
+Then run:
 
 import pyarrow.parquet as pq
+
 table = pq.read_table("export.parquet")
+
 print(table.num_rows)
 print(table.column_names)
 
@@ -146,75 +132,62 @@ Expected output:
 Exit Python:
 
 exit()
-8. Test Compression Support
-
-Create a compressed CSV export:
-
+🗜️ 8. Test Compression Support
+Create Compressed CSV Export
 export_id=$(curl -s -X POST http://localhost:8080/exports \
 -H "Content-Type: application/json" \
 -d '{"format":"csv","compression":"gzip","columns":[{"source":"id","target":"id"}]}' \
 | sed -n 's/.*"exportId":"\([^"]*\)".*/\1/p')
 
 echo $export_id
-
-Check response headers:
-
-*curl -I http://localhost:8080/exports/$export_id/download*
+Check Response Headers
+curl -I http://localhost:8080/exports/$export_id/download
 
 Expected header:
 
 Content-Encoding: gzip
-
-Download compressed file:
-
-*curl http://localhost:8080/exports/$export_id/download -o export.csv.gz*
-
-Extract the file:
-
-*gunzip export.csv.gz*
-
-Verify rows:
-
-*wc -l export.csv*
+Download Compressed File
+curl http://localhost:8080/exports/$export_id/download -o export.csv.gz
+Extract File
+gunzip export.csv.gz
+Verify Rows
+wc -l export.csv
 
 Expected result:
 
 10000001
-9. Run Performance Benchmark
-
-Execute the benchmark endpoint:
-
-*curl http://localhost:8080/exports/benchmark*
+⚡ 9. Run Benchmark
+curl http://localhost:8080/exports/benchmark
 
 Example response:
 
 {
  "datasetRowCount":10000000,
  "results":[
-  {"format":"csv","durationSeconds":...},
-  {"format":"json","durationSeconds":...},
-  {"format":"xml","durationSeconds":...},
-  {"format":"parquet","durationSeconds":...}
+   {"format":"csv"},
+   {"format":"json"},
+   {"format":"xml"},
+   {"format":"parquet"}
  ]
 }
-10. Monitor Memory Usage
+📈 10. Monitor Memory Usage
 
-While exports are running, monitor container memory usage:
+Monitor container memory usage while exports are running.
 
-*docker stats data_export_app*
+docker stats data_export_app
 
-Expected memory usage should remain under:
+Expected memory usage:
 
-256MB
+< 256MB
 
-This confirms that the export system uses streaming and maintains constant memory usage.
+This confirms that the engine uses streaming with constant memory usage.
 
-Cleanup
+🧹 Cleanup
 
-To stop all services:
+Stop containers:
 
 docker-compose down
 
-To remove containers and database data:
+Remove containers and volumes:
 
 docker-compose down -v
