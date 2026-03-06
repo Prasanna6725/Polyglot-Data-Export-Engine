@@ -29,3 +29,7 @@ json_clean.txt
 csv_clean.txt
 xml_clean.txt
 
+export.csv
+export.json
+export.xml
+export.parquet
